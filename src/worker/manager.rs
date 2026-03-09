@@ -217,12 +217,12 @@ impl WorkerState {
     pub async fn get_used_storage(&self) -> Result<u64> {
         let stats = nix::sys::statvfs::statvfs(&self.config.data_path)?;
         let used_blocks = stats.blocks() - stats.blocks_available();
-        Ok(used_blocks * stats.block_size())
+        Ok(used_blocks as u64 * stats.block_size() as u64)
     }
 
     pub async fn get_free_storage(&self) -> Result<u64> {
         let stats = nix::sys::statvfs::statvfs(&self.config.data_path)?;
-        let all_free = stats.blocks_available() * stats.block_size();
+        let all_free = stats.blocks_available() as u64 * stats.block_size() as u64;
         Ok(self.config.data_limit.min(all_free))
     }
 
@@ -393,21 +393,33 @@ impl WorkerState {
             info!("Ingesting batch to {id} ({min} to {max})");
 
             let stamp = std::time::Instant::now();
-            // Load the file trigrams
+            // Load the file trigrams concurrently
+            let futures: Vec<_> = batch.iter().map(|(number, hash)| {
+                let trigram_cache = self.trigrams.clone();
+                let hash = hash.clone();
+                let number = *number;
+                async move {
+                    match trigram_cache.get(id, &hash).await {
+                        Ok(data) => Ok((number, hash, data)),
+                        Err(err) => Err((number, hash, err)),
+                    }
+                }
+            }).collect();
+            let results = futures::future::join_all(futures).await;
+
             let mut trigrams = vec![];
             let mut hashes = vec![];
-            for (number, hash) in &batch {
-                let data = match self.trigrams.get(id, hash).await {
-                    Ok(data) => data,
-                    Err(err) => {
+            for result in results {
+                match result {
+                    Ok((number, hash, data)) => {
+                        hashes.push(hash);
+                        trigrams.push((number, data));
+                    }
+                    Err((_, hash, err)) => {
                         error!("ingest feeder, error loading trigrams ({id}, {hash}): {err}");
-                        self.trigrams.reject(id, hash.clone()).await?;
-                        continue
-                    },
-                };
-
-                hashes.push(hash.clone());
-                trigrams.push((*number, data));
+                        self.trigrams.reject(id, hash).await?;
+                    }
+                }
             }
             let time_load_trigrams = stamp.elapsed().as_secs_f64();
 
