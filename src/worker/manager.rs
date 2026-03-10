@@ -127,15 +127,27 @@ impl WorkerState {
 
     async fn garbage_collector(self: Arc<Self>) {
         while let Err(err) = self._garbage_collector().await {
-            error!("Garbage collector error: {err}");
+            error!("Garbage collector error: {err:#}");
         }
+        error!("Garbage collector exited unexpectedly");
     }
 
     async fn _garbage_collector(&self) -> Result<()> {
         let day: chrono::Duration = chrono::Duration::days(1);
+        info!("Garbage collector started (eviction_threshold: {}, data_reserve: {})",
+            self.config.eviction_threshold, self.config.data_reserve);
         loop {
+            let free = self.get_free_storage().await?;
+            let used = self.get_used_storage().await?;
+            info!("GC pass: free={free}, used={used}, eviction_threshold={}, data_reserve={}",
+                self.config.eviction_threshold, self.config.data_reserve);
+
             // Delete filters that have passed their expiry date
-            for filter in self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await? {
+            let expired = self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await?;
+            if !expired.is_empty() {
+                info!("GC: deleting {} expired filters", expired.len());
+            }
+            for filter in expired {
                 self.delete_index(filter).await?;
             }
 
@@ -143,7 +155,7 @@ impl WorkerState {
             // Disabled when eviction_threshold is 0 — the worker will fill up
             // and stop accepting work (original behaviour).
             // Proactive: free space below eviction_threshold, worker still accepting
-            //   work. Clean up oldest filters at the regular midnight pass.
+            //   work. Clean up oldest filters at the regular check.
             // Emergency: free space below data_reserve, broker has stopped sending.
             //   Recheck every 60s until pressure clears.
             let eviction_enabled = self.config.eviction_threshold > 0;
