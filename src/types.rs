@@ -91,6 +91,14 @@ impl ExpiryGroup {
         })
     }
 
+    /// Create a synthetic expiry group for files with no expiry (TTL=0).
+    /// Uses the seen date offset by +2000 years, placing it in a range that
+    /// is never reached by expiry-based GC but preserves relative ordering
+    /// for eviction under disk pressure.
+    pub fn create_archive(seen: &DateTime<Utc>) -> ExpiryGroup {
+        ExpiryGroup(((seen.year() as u32 + 2000) << 16) | seen.ordinal())
+    }
+
     /// Convert an expiry group to the date of expiry
     pub fn as_timestamp(&self) -> Option<DateTime<Utc>> {
         let year = self.0 >> 16;

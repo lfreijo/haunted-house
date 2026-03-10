@@ -362,7 +362,10 @@ impl HouseCore {
                 hash: Sha256::from_str(&file.sha256)?,
                 access: self.prepare_classification(&file.classification)?,
                 access_string: file.classification.clone(),
-                expiry: ExpiryGroup::create(&file.expiry)
+                expiry: match file.expiry {
+                    Some(_) => ExpiryGroup::create(&file.expiry),
+                    None => ExpiryGroup::create_archive(&file.seen),
+                }
             },
             response: vec![send]
         }))?;
