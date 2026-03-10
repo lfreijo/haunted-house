@@ -1378,6 +1378,7 @@ impl<FieldType, SourceType> Drop for ScanCursor<FieldType, SourceType> {
 
 /// elasticsearch response for a search query
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct SearchResult<FieldType: Default, SourceType> {
     /// time taken to complete search call
     pub took: u64,
@@ -1389,6 +1390,7 @@ pub struct SearchResult<FieldType: Default, SourceType> {
 
 /// hits section for an elasticsearch response to a search query
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SearchResultHits<FieldType: Default, SourceType> {
     /// information on the total number of matching documents as distinct from the potentially more limited set returned
     pub total: SearchResultHitTotals,
@@ -1400,6 +1402,7 @@ pub struct SearchResultHits<FieldType: Default, SourceType> {
 
 /// total hit value with form of total for a search
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SearchResultHitTotals {
     /// number of or bound on the total size of the matching document set
     pub value: u64,

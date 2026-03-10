@@ -585,6 +585,7 @@ impl AzureBlobStore {
     }
 
     /// Upload a file from disk
+    #[allow(dead_code)]
     pub async fn upload(&self, label: &str, path: PathBuf) -> Result<()> {
         let client = self.client.blob_client(label);
         let sas = client.shared_access_signature(azure_storage::prelude::BlobSasPermissions {
@@ -758,7 +759,7 @@ impl S3BlobStore {
     /// Connect to the s3 store and ensure resources exist
     async fn new(config: S3Config) -> Result<Self> {
         // Ok(S3BlobStore { client: bucket })
-        let mut loader = aws_config::defaults(BehaviorVersion::v2024_03_28());
+        let mut loader = aws_config::defaults(BehaviorVersion::v2025_08_07());
 
         // Override the region
         loader = loader.region(aws_types::region::Region::new(config.region_name));

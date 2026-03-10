@@ -49,6 +49,7 @@ impl<T: Clone> Sender<T> {
 }
 
 pub struct Receiver<T: Clone> {
+    #[allow(dead_code)]
     pub label: u32,
     input: tokio::sync::mpsc::UnboundedReceiver<T>,
     next: Option<Option<T>>,

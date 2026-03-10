@@ -420,6 +420,7 @@ impl<'de> Deserialize<'de> for TrigramSet {
     }
 }
 
+#[allow(dead_code)]
 impl TrigramSet {
     /// Create an empty bitset
     pub fn new() -> Self {
@@ -437,7 +438,7 @@ impl TrigramSet {
     // }
 
     /// Create an iterator over the indices of the set bits
-    pub fn iter(&self) -> TrigramIterator {
+    pub fn iter(&self) -> TrigramIterator<'_> {
         let mut iter = self.chunks.iter();
         let current = iter.next().unwrap();
         TrigramIterator { iter, current_index: 0, current: current.iter() }
@@ -543,6 +544,7 @@ impl Iterator for ChunkIter<'_> {
 }
 
 
+#[allow(dead_code)]
 impl Chunk {
     /// Default empty chunk
     const EMPTY: Self = Self::Empty;
@@ -560,7 +562,7 @@ impl Chunk {
     // }
 
     /// Create an iterator over the indices of set bits
-    pub fn iter(&self) -> ChunkIter {
+    pub fn iter(&self) -> ChunkIter<'_> {
         match self {
             Chunk::Empty => ChunkIter::Empty,
             Chunk::Added(items) => ChunkIter::Added(items.iter()),

@@ -33,6 +33,7 @@ pub struct WorkerState {
     pub database: Database,
     pub running: watch::Receiver<bool>,
     pub filters: RwLock<HashMap<FilterID, Arc<JournalFilter>>>,
+    #[allow(dead_code)] // Held to keep storage connections alive
     pub file_storage: MultiStorage,
     pub file_cache: BlobCache,
     pub trigrams: Arc<TrigramCache>,
@@ -169,11 +170,16 @@ impl WorkerState {
                 }
             }
 
-            // When eviction is enabled and the worker is still under hard pressure,
-            // recheck in 60s. Otherwise sleep until midnight for the next GC pass.
+            // Sleep duration depends on current state:
+            // - Hard pressure (free < data_reserve): recheck every 60s
+            // - Eviction enabled but no pressure: recheck every 5 minutes so we
+            //   catch disk filling up during the day (not just at midnight)
+            // - Eviction disabled: sleep until midnight for expiry-based GC only
             let sleep_duration = if eviction_enabled && self.check_storage_pressure().await? {
                 warn!("Storage pressure persists after eviction pass");
                 std::time::Duration::from_secs(60)
+            } else if eviction_enabled {
+                std::time::Duration::from_secs(300)
             } else {
                 let tomorrow = chrono::Utc::now().duration_trunc(day)? + day;
                 (tomorrow - chrono::Utc::now()).to_std()?
