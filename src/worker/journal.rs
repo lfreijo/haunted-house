@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::{cmp::Reverse, collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque}};
+use std::{cmp::Reverse, collections::{hash_map::Entry, BinaryHeap, BTreeSet, HashMap, HashSet, VecDeque}};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc::{Receiver, Sender}, Arc};
 use std::fs::File; 
@@ -1088,22 +1088,25 @@ impl TrigramCursor {
 /// yield the trigrams in sequence that they occur. If a trigram doesn't occur
 /// in one of the files it is skipped. When the trigram is returned the file
 /// ids of the files that contain it are returned by argument.
+///
+/// Uses a min-heap for O(T log K) merge instead of O(T × K) linear scan,
+/// where T = unique trigrams and K = number of files.
 pub struct IdCollector<'a> {
-    /// counter for which trigram we are on
-    acceptable: u32,
-    /// Set of files (ids and trigrams) to pass through
+    /// Min-heap entries: (trigram, index into iterators vec)
+    heap: BinaryHeap<Reverse<(u32, usize)>>,
+    /// File ID and trigram stream for each file, indexed by position
     iterators: Vec<(u64, StreamDecode<'a>)>,
-    // candidates: BTreeSet<u32>,
-    remove: Vec<u64>,
 }
 
 impl<'a> IdCollector<'a> {
     pub fn new(iterators: Vec<(u64, StreamDecode<'a>)>) -> Self {
-        Self {
-            acceptable: 0,
-            iterators,
-            remove: vec![],
+        let mut heap = BinaryHeap::with_capacity(iterators.len());
+        for (idx, (_, stream)) in iterators.iter().enumerate() {
+            if let Some(value) = stream.peek() {
+                heap.push(Reverse((value as u32, idx)));
+            }
         }
+        Self { heap, iterators }
     }
 
     pub fn new_from_vec(iterators: &'a [(u64, Vec<u8>)]) -> Self {
@@ -1113,45 +1116,30 @@ impl<'a> IdCollector<'a> {
     /// Function to drive the iteration described above
     #[inline(always)]
     pub fn next(&mut self, hits: &mut Vec<u64>) -> Option<u32> {
-        // hits.clear(); // if we return Some we will always call clear in the inner loop
+        let Reverse((trigram, idx)) = self.heap.pop()?;
+        hits.clear();
+        hits.push(self.iterators[idx].0);
 
-        let mut selected_trigram = u32::MAX;
+        // Advance the stream we just popped and re-insert if it has more
+        self.iterators[idx].1.skip_one();
+        if let Some(next_val) = self.iterators[idx].1.peek() {
+            self.heap.push(Reverse((next_val as u32, idx)));
+        }
 
-        'outer: for (id, input) in self.iterators.iter_mut() {
-            while let Some(value) = input.peek() {
-                let value = value as u32;
-                if value < self.acceptable {
-                    input.skip_one();
-                    continue
-                }
-
-                match value.cmp(&selected_trigram) {
-                    std::cmp::Ordering::Less => {
-                        hits.clear();
-                        hits.push(*id);
-                        selected_trigram = value;
-                    },
-                    std::cmp::Ordering::Equal => {
-                        hits.push(*id);
-                    },
-                    std::cmp::Ordering::Greater => {},
-                }
-                continue 'outer
+        // Collect all other streams that share this same trigram
+        while let Some(&Reverse((t, i))) = self.heap.peek() {
+            if t != trigram {
+                break;
             }
-            self.remove.push(*id)
+            self.heap.pop();
+            hits.push(self.iterators[i].0);
+            self.iterators[i].1.skip_one();
+            if let Some(next_val) = self.iterators[i].1.peek() {
+                self.heap.push(Reverse((next_val as u32, i)));
+            }
         }
 
-        if !self.remove.is_empty() {
-            self.iterators.retain(|(id, _)|!self.remove.contains(id));
-            self.remove.clear();
-        }
-
-        if selected_trigram == u32::MAX {
-            None
-        } else {
-            self.acceptable = selected_trigram + 1;
-            Some(selected_trigram)
-        }
+        Some(trigram)
     }
 }
 
