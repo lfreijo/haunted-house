@@ -10,7 +10,7 @@ use crate::config::WorkerSettings;
 use crate::query::TrigramQuery;
 use crate::storage::MultiStorage;
 use crate::timing::ResourceTracker;
-use crate::types::{ExpiryGroup, FilterID, FileInfo};
+use crate::types::{ExpiryGroup, FilterID, FileInfo, Sha256};
 
 use super::YaraTask;
 use super::database::{IngestStatus, Database, IngestStatusBundle};
@@ -19,6 +19,15 @@ use super::journal::JournalFilter;
 // use super::filter_worker::{FilterWorker, WriterCommand};
 use super::interface::{FilterSearchResponse, UpdateFileInfoResponse, IngestFilesResponse, StorageStatus};
 use super::trigrams::TrigramCache;
+
+/// A batch of files with pre-loaded trigram data, ready for journal write.
+struct PreparedBatch {
+    batch: Vec<(u64, Sha256)>,
+    trigrams: Vec<(u64, Vec<u8>)>,
+    hashes: Vec<Sha256>,
+    time_get_batch: f64,
+    time_load_trigrams: f64,
+}
 
 pub struct WorkerState {
     pub database: Database,
@@ -353,97 +362,126 @@ impl WorkerState {
         info!("Starting ingest feeder for {id}");
         let batch_size = self.config.ingest_batch_size;
         let batch_delay = std::time::Duration::from_secs(self.config.ingest_batch_delay_seconds);
-        let mut delay_from: Option<std::time::Instant> = None;
 
-        while *self.running.borrow() && worker.is_running() {
-            // Get next set of incomplete files
-            let stamp = std::time::Instant::now();
-            let batch = self.database.get_ingest_batch(id, batch_size).await?;
-            let time_get_batch = stamp.elapsed().as_secs_f64();
+        // Prefetch channel: producer fetches batches + loads trigrams while consumer writes to journal.
+        // Capacity 1 means at most one batch is pre-loaded while the current one is being written.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PreparedBatch>(1);
 
-            // figure out if we have enough files to process
-            if batch.is_empty() {
-                let last_write = worker.last_write().await?;
-                let generation = worker.generation_counter().await?;
-                if generation > Self::defrag_limit(last_write) {
-                    if let Ok(_token) = self.defrag_token.try_acquire() {
-                        worker.defrag().await?;
+        // Spawn producer: fetches batches from DB and loads trigram data
+        let producer_self = self.clone();
+        let producer_worker = worker.clone();
+        let producer = tokio::spawn(async move {
+            let mut delay_from: Option<std::time::Instant> = None;
+            while *producer_self.running.borrow() && producer_worker.is_running() {
+                let stamp = std::time::Instant::now();
+                let batch = match producer_self.database.get_ingest_batch(id, batch_size).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        error!("ingest feeder producer, get_ingest_batch error: {err}");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue
+                    }
+                };
+                let time_get_batch = stamp.elapsed().as_secs_f64();
+
+                if batch.is_empty() {
+                    let last_write = match producer_worker.last_write().await {
+                        Ok(v) => v,
+                        Err(_) => { continue }
+                    };
+                    let generation = match producer_worker.generation_counter().await {
+                        Ok(v) => v,
+                        Err(_) => { continue }
+                    };
+                    if generation > Self::defrag_limit(last_write) {
+                        if let Ok(_token) = producer_self.defrag_token.try_acquire() {
+                            let _ = producer_worker.defrag().await;
+                            continue
+                        }
+                    }
+                    _ = tokio::time::timeout(tokio::time::Duration::from_secs(600), producer_worker.notified()).await;
+                    continue
+                } else if batch.len() < batch_size as usize {
+                    let wait_start = delay_from.get_or_insert_with(std::time::Instant::now);
+                    if let Some(wait_time) = batch_delay.checked_sub(wait_start.elapsed()) {
+                        _ = tokio::time::timeout(wait_time, producer_worker.notified()).await;
                         continue
                     }
                 }
+                delay_from = None;
 
-                _ = tokio::time::timeout(tokio::time::Duration::from_secs(600), worker.notified()).await;
-                continue
-            } else if batch.len() < batch_size as usize {
-                let wait_start = delay_from.get_or_insert_with(std::time::Instant::now);
-                if let Some(wait_time) = batch_delay.checked_sub(wait_start.elapsed()) {
-                    _ = tokio::time::timeout(wait_time, worker.notified()).await;
-                    continue
+                let mut min = u64::MAX;
+                let mut max = u64::MIN;
+                for (number, _) in &batch {
+                    min = min.min(*number);
+                    max = max.max(*number);
+                }
+                info!("Ingesting batch to {id} ({min} to {max})");
+
+                // Load trigrams concurrently
+                let stamp = std::time::Instant::now();
+                let futures: Vec<_> = batch.iter().map(|(number, hash)| {
+                    let trigram_cache = producer_self.trigrams.clone();
+                    let hash = hash.clone();
+                    let number = *number;
+                    async move {
+                        match trigram_cache.get(id, &hash).await {
+                            Ok(data) => Ok((number, hash, data)),
+                            Err(err) => Err((number, hash, err)),
+                        }
+                    }
+                }).collect();
+                let results = futures::future::join_all(futures).await;
+
+                let mut trigrams = vec![];
+                let mut hashes = vec![];
+                for result in results {
+                    match result {
+                        Ok((number, hash, data)) => {
+                            hashes.push(hash);
+                            trigrams.push((number, data));
+                        }
+                        Err((_, hash, err)) => {
+                            error!("ingest feeder, error loading trigrams ({id}, {hash}): {err}");
+                            if let Err(e) = producer_self.trigrams.reject(id, hash).await {
+                                error!("{e}");
+                            }
+                        }
+                    }
+                }
+                let time_load_trigrams = stamp.elapsed().as_secs_f64();
+
+                let prepared = PreparedBatch { batch, trigrams, hashes, time_get_batch, time_load_trigrams };
+                if tx.send(prepared).await.is_err() {
+                    break; // consumer dropped
                 }
             }
-            delay_from = None;
+        });
 
-            // get the range of ids in the batch
-            let mut min = u64::MAX;
-            let mut max = u64::MIN;
-            for (number, _) in &batch {
-                min = min.min(*number);
-                max = max.max(*number);
-            }
-            info!("Ingesting batch to {id} ({min} to {max})");
-
+        // Consumer: writes prepared batches to journal
+        while let Some(prepared) = rx.recv().await {
             let stamp = std::time::Instant::now();
-            // Load the file trigrams concurrently
-            let futures: Vec<_> = batch.iter().map(|(number, hash)| {
-                let trigram_cache = self.trigrams.clone();
-                let hash = hash.clone();
-                let number = *number;
-                async move {
-                    match trigram_cache.get(id, &hash).await {
-                        Ok(data) => Ok((number, hash, data)),
-                        Err(err) => Err((number, hash, err)),
-                    }
-                }
-            }).collect();
-            let results = futures::future::join_all(futures).await;
-
-            let mut trigrams = vec![];
-            let mut hashes = vec![];
-            for result in results {
-                match result {
-                    Ok((number, hash, data)) => {
-                        hashes.push(hash);
-                        trigrams.push((number, data));
-                    }
-                    Err((_, hash, err)) => {
-                        error!("ingest feeder, error loading trigrams ({id}, {hash}): {err}");
-                        self.trigrams.reject(id, hash).await?;
-                    }
-                }
-            }
-            let time_load_trigrams = stamp.elapsed().as_secs_f64();
-
-            // Ingest the data to the journal
-            let stamp = std::time::Instant::now();
-            if !worker.write_batch(trigrams).await.context("write_batch")? {
+            if !worker.write_batch(prepared.trigrams).await.context("write_batch")? {
                 continue
             }
             let time_install = stamp.elapsed().as_secs_f64();
 
-            // Commit those file ids
             let stamp = std::time::Instant::now();
-            let processing = self.database.finished_ingest(id, batch).await?;
+            let processing = self.database.finished_ingest(id, prepared.batch).await?;
             let time_finish = stamp.elapsed().as_secs_f64();
 
             let stamp = std::time::Instant::now();
-            for hash in hashes {
+            for hash in prepared.hashes {
                 if let Err(err) = self.trigrams.release(id, &hash).await {
                     error!("{err}");
                 }
             }
             let time_cleanup = stamp.elapsed().as_secs_f64();
-            info!("{id} Batch timing; get batch {time_get_batch}; trigrams {time_load_trigrams}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}");
+            info!("{id} Batch timing; get batch {:.6}; trigrams {:.6}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}",
+                prepared.time_get_batch, prepared.time_load_trigrams);
         }
+
+        producer.abort();
         return Ok(())
     }
 
