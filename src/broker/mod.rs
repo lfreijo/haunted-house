@@ -29,6 +29,7 @@ use anyhow::{Result, Context};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::access::AccessControl;
 use crate::broker::elastic::Datastore;
@@ -1127,12 +1128,17 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
 
     let mut workers = vec![];
     let mut result_stream = {
+        let ws_config = WebSocketConfig {
+            max_frame_size: Some(256 << 20),   // 256 MiB (default is 16 MiB)
+            max_message_size: Some(256 << 20), // 256 MiB (default is 64 MiB)
+            ..Default::default()
+        };
         let (client_sender, result_stream) = mpsc::channel(128);
         for (worker, address) in &core.config.workers {
             workers.push(worker.clone());
             let address = address.websocket("/search/filter")?;
             let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-                address.clone(), None, false, Some(core.ws_connector.clone())).await
+                address.clone(), Some(ws_config), false, Some(core.ws_connector.clone())).await
                 .context(format!("Unable to connect to worker: {address}"))?;
             let client_sender = client_sender.clone();
             let request_body = request_body.clone();
@@ -1165,14 +1171,33 @@ async fn _search_worker(core: Arc<HouseCore>, progress_sender: &mut watch::Sende
     };
 
     // Absorb messages from the workers until we have them all
+    const FILTERING_TIMEOUT: Duration = Duration::from_secs(3600); // 1 hour max for filtering phase
     let candidates = SqliteSet::<FileInfo>::new_temp().await?;
     {
         let mut complete: HashMap<WorkerID, HashSet<FilterID>> = Default::default();
         let mut initial: HashMap<WorkerID, Vec<FilterID>> = Default::default();
+        let filtering_deadline = tokio::time::Instant::now() + FILTERING_TIMEOUT;
         loop {
-            let (worker, message) = match result_stream.recv().await {
-                Some(message) => message,
-                None => break,
+            let (worker, message) = match tokio::time::timeout_at(filtering_deadline, result_stream.recv()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break, // all workers finished
+                Err(_) => {
+                    // Timeout: log which workers haven't completed
+                    let mut missing = vec![];
+                    for worker in &workers {
+                        let expected = initial.get(worker).map(Vec::len).unwrap_or(0);
+                        let completed = complete.get(worker).map(HashSet::len).unwrap_or(0);
+                        if expected == 0 || completed < expected {
+                            missing.push(format!("{worker} ({completed}/{expected} filters)"));
+                        }
+                    }
+                    let msg = format!("Filtering phase timed out after {}s; incomplete workers: {}",
+                        FILTERING_TIMEOUT.as_secs(), missing.join(", "));
+                    warn!("Search {code}: {msg}");
+                    status.errors.push(msg);
+                    status.truncated = true;
+                    break;
+                }
             };
 
             info!("Search progress: {message:?}");

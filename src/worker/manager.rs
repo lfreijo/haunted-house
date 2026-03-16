@@ -515,12 +515,27 @@ impl WorkerState {
         return Ok(true)
     }
 
+    /// Maximum number of FileInfo items per Candidates message to keep WebSocket frames
+    /// well under typical size limits (~2 MiB per chunk).
+    const CANDIDATES_CHUNK_SIZE: usize = 10_000;
+
     pub async fn query_filter(self: Arc<Self>, id: FilterID, query: Arc<TrigramQuery>, access: HashSet<String>, respond: mpsc::Sender<FilterSearchResponse>) {
         if let Some(filter) = self.filters.read().await.get(&id) {
             match filter.query(query).await {
                 Ok(file_indices) => {
                     match self.database.select_files(id, &file_indices, &access).await {
-                        Ok(files) => { _ = respond.send(FilterSearchResponse::Candidates(id, files)).await; },
+                        Ok(files) => {
+                            // Chunk large result sets to avoid oversized WebSocket frames
+                            if files.len() <= Self::CANDIDATES_CHUNK_SIZE {
+                                _ = respond.send(FilterSearchResponse::Candidates(id, files)).await;
+                            } else {
+                                for chunk in files.chunks(Self::CANDIDATES_CHUNK_SIZE) {
+                                    if respond.send(FilterSearchResponse::Candidates(id, chunk.to_vec())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        },
                         Err(err) => { _ = respond.send(FilterSearchResponse::Error(Some(id), err.to_string())).await; }
                     };
                 }
