@@ -16,6 +16,7 @@ use serde::{Serialize, Deserialize, de::Error};
 
 use crate::config::WorkerSettings;
 use crate::error::ErrorKinds;
+use crate::metrics;
 use crate::storage::MultiStorage;
 use crate::types::{Sha256, FilterID, FileInfo};
 
@@ -105,6 +106,7 @@ impl TrigramCache {
                     break false
                 };
                 if rejected {
+                    metrics::FETCHER_REJECTED.inc();
                     let mut rejected = core.rejected.write().await;
                     rejected.insert((filter, hash.clone()));
                 }
@@ -119,6 +121,8 @@ impl TrigramCache {
 
     async fn _fetch_file(&self, filter: FilterID, hash: &Sha256) -> Result<()> {
         let _permit = self.permits.acquire().await?;
+        metrics::FETCHER_ACTIVE_DOWNLOADS.inc();
+        let download_start = std::time::Instant::now();
 
         // Gather the file content
         let stream = self.files.stream(&hash.hex()).await.context("setup stream")?;
@@ -128,14 +132,19 @@ impl TrigramCache {
         let cache_path = self._path(filter, hash);
         let temp_dir = self.temp_dir.clone();
         let filter_dir = self._filter_path(filter);
-        tokio::task::spawn_blocking(move ||{
+        let result = tokio::task::spawn_blocking(move ||{
             let mut temp = tempfile::NamedTempFile::new_in(&temp_dir)?;
             temp.write_all(&postcard::to_allocvec(&trigrams)?)?;
             temp.flush()?;
             std::fs::create_dir_all(filter_dir)?;
             temp.persist(cache_path)?;
             Result::<(), ErrorKinds>::Ok(())
-        }).await??;
+        }).await?;
+
+        metrics::FETCHER_ACTIVE_DOWNLOADS.dec();
+        metrics::FETCHER_DOWNLOAD_DURATION.observe(download_start.elapsed().as_secs_f64());
+
+        result?;
         return Ok(())
     }
 

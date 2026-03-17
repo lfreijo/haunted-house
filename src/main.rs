@@ -24,6 +24,8 @@ mod broker;
 mod blob_cache;
 mod worker;
 mod pool;
+#[allow(missing_docs)]
+pub mod metrics;
 
 use std::path::PathBuf;
 use std::str::FromStr;

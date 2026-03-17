@@ -92,5 +92,8 @@ aws-smithy-runtime = { version = "1.5", features = [ "tls-rustls" ] }
 # kube = {version = "0.80", features = ["runtime", "derive"], optional = true }
 # k8s-openapi = { version = "0.17", features = ["v1_26"], optional = true }
 
+# Metrics
+prometheus = "0.13"
+
 [dev-dependencies]
 assertor = "*"

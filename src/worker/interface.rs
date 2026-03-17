@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
+use crate::metrics;
 use crate::query::TrigramQuery;
 use crate::timing::ResourceReport;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID};
@@ -209,6 +210,14 @@ async fn list_ingest_files(state: Data<&Arc<WorkerState>>) -> poem::Result<Json<
 }
 
 #[handler]
+fn get_metrics() -> poem::Result<poem::Response> {
+    let body = metrics::gather_metrics();
+    Ok(poem::Response::builder()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(body))
+}
+
+#[handler]
 fn get_online_status() {
     return
 }
@@ -264,6 +273,7 @@ pub async fn serve(bind_address: SocketAddr, tls: Option<TLSConfig>, state: Arc<
         .at("/files/update", post(update_file_info))
         .at("/files/ingest", post(ingest_files))
         .at("/files/ingest-queues", get(list_ingest_files))
+        .at("/metrics", get(get_metrics))
         .at("/status/online", get(get_online_status))
         .at("/status/ready", get(get_ready_status))
         .at("/status/detail", get(get_detail_status))

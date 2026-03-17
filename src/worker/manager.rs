@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::blob_cache::{BlobHandle, BlobCache};
 use crate::config::WorkerSettings;
+use crate::metrics;
 use crate::query::TrigramQuery;
 use crate::storage::MultiStorage;
 use crate::timing::ResourceTracker;
@@ -137,6 +138,7 @@ impl WorkerState {
         info!("Garbage collector started (eviction_threshold: {}, data_reserve: {})",
             self.config.eviction_threshold, self.config.data_reserve);
         loop {
+            let gc_start = std::time::Instant::now();
             let free = self.get_free_storage().await?;
             let used = self.get_used_storage().await?;
             info!("GC pass: free={free}, used={used}, eviction_threshold={}, data_reserve={}",
@@ -146,6 +148,7 @@ impl WorkerState {
             let expired = self.database.get_filters(&ExpiryGroup::min(), &ExpiryGroup::yesterday()).await?;
             if !expired.is_empty() {
                 info!("GC: deleting {} expired filters", expired.len());
+                metrics::GC_FILTERS_EXPIRED.inc_by(expired.len() as f64);
             }
             for filter in expired {
                 self.delete_index(filter).await?;
@@ -179,8 +182,11 @@ impl WorkerState {
                     }
                     warn!("Evicting filter {id} (expiry group: {})", expiry.as_u32());
                     self.delete_index(id).await?;
+                    metrics::GC_FILTERS_EVICTED.inc();
                 }
             }
+
+            metrics::GC_RUN_DURATION.observe(gc_start.elapsed().as_secs_f64());
 
             // Sleep duration depends on current state:
             // - Hard pressure (free < data_reserve): recheck every 60s
@@ -461,6 +467,7 @@ impl WorkerState {
                         }
                         Err((_, hash, err)) => {
                             error!("ingest feeder, error loading trigrams ({id}, {hash}): {err}");
+                            metrics::FETCHER_ERRORS.inc();
                             if let Err(e) = producer_self.trigrams.reject(id, hash).await {
                                 error!("{e}");
                             }
@@ -478,6 +485,8 @@ impl WorkerState {
 
         // Consumer: writes prepared batches to journal
         while let Some(prepared) = rx.recv().await {
+            let batch_file_count = prepared.hashes.len() as f64;
+
             let stamp = std::time::Instant::now();
             if !worker.write_batch(prepared.trigrams).await.context("write_batch")? {
                 continue
@@ -497,6 +506,15 @@ impl WorkerState {
             let time_cleanup = stamp.elapsed().as_secs_f64();
             info!("{id} Batch timing; get batch {:.6}; trigrams {:.6}; install {time_install}; finish {time_finish} ({processing}); cleanup {time_cleanup}",
                 prepared.time_get_batch, prepared.time_load_trigrams);
+
+            // Record metrics
+            metrics::FETCHER_BATCHES_WRITTEN.inc();
+            metrics::FETCHER_FILES_INGESTED.inc_by(batch_file_count);
+            metrics::FETCHER_BATCH_SIZE.observe(batch_file_count);
+            metrics::INGEST_GET_BATCH_DURATION.observe(prepared.time_get_batch);
+            metrics::INGEST_TRIGRAM_DURATION.observe(prepared.time_load_trigrams);
+            metrics::INGEST_WRITE_DURATION.observe(time_install);
+            metrics::INGEST_FINISH_DURATION.observe(time_finish);
         }
 
         producer.abort();
@@ -546,6 +564,11 @@ impl WorkerState {
 
     pub async fn run_yara(&self, yara_task: YaraTask) -> Result<(Vec<FileInfo>, Vec<String>)> {
         debug!("yara task {} starting", yara_task.id);
+        metrics::SCANNER_SCANS_STARTED.inc();
+        metrics::SCANNER_ACTIVE_SCANS.inc();
+        let scan_start = std::time::Instant::now();
+        let total_files = yara_task.files.len();
+
         let mut errors = vec![];
         let filter_handle = {
             let (file_send, mut file_recv) = mpsc::unbounded_channel::<(FileInfo, Arc<BlobHandle>)>();
@@ -573,6 +596,7 @@ impl WorkerState {
             });
 
             // Load the files and send them to the worker
+            let mut skipped = 0u64;
             for info in yara_task.files {
                 // download the file
                 let hash_string = info.hash.hex();
@@ -583,19 +607,33 @@ impl WorkerState {
                         let error_string = format!("File not available: {hash_string} {err}");
                         info!("{error_string}");
                         errors.push(error_string);
+                        skipped += 1;
                     },
                 }
             }
+            metrics::SCANNER_FILES_SKIPPED.inc_by(skipped as f64);
 
             filter_handle
         };
 
         // Wait for worker to finish
-        let filtered = filter_handle.await??;
+        let result = filter_handle.await?;
+        metrics::SCANNER_ACTIVE_SCANS.dec();
+        metrics::SCANNER_SCAN_DURATION.observe(scan_start.elapsed().as_secs_f64());
+        metrics::SCANNER_FILES_SCANNED.inc_by(total_files as f64);
 
-        // Report the result to the broker
-        info!("yara task {} finished ({} hits)", yara_task.id, filtered.len());
-        return Ok((filtered, errors))
+        match result {
+            Ok(filtered) => {
+                metrics::SCANNER_SCANS_COMPLETED.inc();
+                metrics::SCANNER_HITS.inc_by(filtered.len() as f64);
+                info!("yara task finished ({} hits)", filtered.len());
+                Ok((filtered, errors))
+            }
+            Err(err) => {
+                metrics::SCANNER_SCANS_ERRORED.inc();
+                Err(err)
+            }
+        }
     }
 
 }
