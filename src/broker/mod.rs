@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use crate::access::AccessControl;
 use crate::broker::elastic::Datastore;
 use crate::config::{BrokerSettings, WorkerAddress, WorkerTLSConfig};
+use crate::metrics;
 use crate::query::parse_yara_signature;
 use crate::sqlite_set::SqliteSet;
 use crate::types::{Sha256, ExpiryGroup, FileInfo, FilterID, WorkerID};
@@ -45,6 +46,10 @@ use self::interface::{SearchRequest, StatusReport, FilterStatus, SearchProgress}
 
 /// Entry point function to the broker
 pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
+    // Register prometheus metrics
+    metrics::register_broker_metrics();
+    metrics::BUILD_INFO.with_label_values(&[env!("CARGO_PKG_VERSION"), "broker"]).set(1.0);
+
     // Initialize authenticator
     info!("Initializing Authenticator");
     let auth = Authenticator::from_config(config.authentication.clone())?;
@@ -62,6 +67,41 @@ pub (crate) async fn main(config: crate::config::BrokerSettings) -> Result<()> {
     info!("Starting server core.");
     let core = HouseCore::new(client,auth, config.clone()).await
         .context("Error launching core.")?;
+
+    // Spawn periodic metrics updater (fetcher status, active searches, uptime)
+    let metrics_core = core.clone();
+    let metrics_start = std::time::Instant::now();
+    tokio::spawn(async move {
+        loop {
+            metrics::UPTIME_SECONDS.set(metrics_start.elapsed().as_secs_f64());
+
+            // Fetcher status via control channel
+            let (tx, rx) = oneshot::channel();
+            if metrics_core.fetcher_control_queue.send(FetchControlMessage::Status(tx)).await.is_ok() {
+                if let Ok(status) = rx.await {
+                    let now = chrono::Utc::now();
+                    let checkpoint_lag = (now - status.checkpoint_data).num_seconds().max(0) as f64;
+                    let cursor_lag = (now - status.read_cursor).num_seconds().max(0) as f64;
+                    metrics::BROKER_CHECKPOINT_LAG.set(checkpoint_lag);
+                    metrics::BROKER_READ_CURSOR_LAG.set(cursor_lag);
+                    metrics::BROKER_PENDING_FILES.set(status.pending_files as f64);
+                    metrics::BROKER_INFLIGHT.set(status.inflight as f64);
+                    metrics::BROKER_FETCHER_SEARCHES_PER_MIN.set(status.last_minute_searches as f64);
+                    metrics::BROKER_FETCHER_THROUGHPUT_PER_MIN.set(status.last_minute_throughput as f64);
+                    metrics::BROKER_FETCHER_RETRIES_PER_MIN.set(status.last_minute_retries as f64);
+                    metrics::BROKER_LAST_FETCH_ROWS.set(status.last_fetch_rows as f64);
+                }
+            }
+
+            // Active searches
+            {
+                let searches = metrics_core.running_searches.read().await;
+                metrics::BROKER_ACTIVE_SEARCHES.set(searches.len() as i64);
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+        }
+    });
 
     // Start http interface
     let bind_address = match config.bind_address {
@@ -281,6 +321,7 @@ impl HouseCore {
         self.database.retrohunt.save(&search.key, &search, None).await?;
 
         // Start the search worker
+        metrics::BROKER_SEARCHES_SUBMITTED.inc();
         let mut searches = self.running_searches.write().await;
         let (send, recv) = watch::channel(SearchProgress::Starting { key: search.key.clone() });
         let handle = tokio::task::spawn(search_worker(self.clone(), send, search));
@@ -1083,6 +1124,7 @@ const MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Entrypoint for the search worker
 async fn search_worker(core: Arc<HouseCore>, mut progress: watch::Sender<SearchProgress>, mut status: models::Retrohunt) {
+    let search_start = std::time::Instant::now();
     let mut timeout = MILLISECOND;
     // Keep restarting the search until it completes
     while let Err(err) = _search_worker(core.clone(), &mut progress, &mut status).await {
@@ -1090,6 +1132,8 @@ async fn search_worker(core: Arc<HouseCore>, mut progress: watch::Sender<SearchP
         tokio::time::sleep(timeout).await;
         timeout = MAX_DELAY.min(timeout * 2);
     }
+    metrics::BROKER_SEARCHES_COMPLETED.inc();
+    metrics::BROKER_SEARCH_DURATION.observe(search_start.elapsed().as_secs_f64());
     _ = progress.send(SearchProgress::Finished { key: status.key.clone(), search: status });
 }
 

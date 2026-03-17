@@ -27,6 +27,7 @@ use tokio::sync::watch;
 
 use crate::config::TLSConfig;
 use crate::logging::LoggerMiddleware;
+use crate::metrics;
 use crate::timing::ResourceReport;
 use crate::types::{WorkerID, FilterID};
 use crate::worker::interface::StorageStatus;
@@ -268,6 +269,15 @@ async fn search_status(Data(interface): Data<&SearcherInterface>, Path(code): Pa
     }))
 }
 
+/// API endpoint for Prometheus metrics
+#[handler]
+fn get_metrics() -> poem::Result<poem::Response> {
+    let body = metrics::gather_metrics();
+    Ok(poem::Response::builder()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(body))
+}
+
 /// API endpoint for null status that is always available
 #[handler]
 async fn get_status() -> Result<()> {
@@ -322,6 +332,7 @@ pub async fn _serve(bind_address: String, tls: Option<TLSConfig>, core: Arc<Hous
         .at("/search/", post(add_search))
         .at("/search/:code", get(search_status))
         .at("/repeat/", post(repeat_search))
+        .at("/metrics", get(get_metrics))
         .at("/status", get(get_status))
         .at("/status/detailed", get(get_detailed_status))
         .with(TokenMiddleware::new(core.clone()))

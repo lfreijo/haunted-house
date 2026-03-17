@@ -178,6 +178,75 @@ lazy_static! {
     ).unwrap();
 
     // ========================================================================
+    // Broker: fetcher metrics
+    // ========================================================================
+
+    /// Seconds between checkpoint timestamp and now (ingestion lag).
+    pub static ref BROKER_CHECKPOINT_LAG: Gauge = Gauge::new(
+        "haunted_house_broker_checkpoint_lag_seconds", "Seconds between checkpoint timestamp and now (ingestion lag)."
+    ).unwrap();
+
+    /// Seconds between read cursor and now (how far behind ES polling is).
+    pub static ref BROKER_READ_CURSOR_LAG: Gauge = Gauge::new(
+        "haunted_house_broker_read_cursor_lag_seconds", "Seconds between read cursor and now."
+    ).unwrap();
+
+    /// Files pending ingestion (not yet assigned to workers).
+    pub static ref BROKER_PENDING_FILES: Gauge = Gauge::new(
+        "haunted_house_broker_pending_files", "Files pending ingestion (not yet assigned to workers)."
+    ).unwrap();
+
+    /// Files currently in flight (being ingested).
+    pub static ref BROKER_INFLIGHT: Gauge = Gauge::new(
+        "haunted_house_broker_inflight", "Files currently in flight in the fetcher."
+    ).unwrap();
+
+    /// ES queries per minute by the file fetcher.
+    pub static ref BROKER_FETCHER_SEARCHES_PER_MIN: Gauge = Gauge::new(
+        "haunted_house_broker_fetcher_searches_per_minute", "ES queries per minute by the file fetcher."
+    ).unwrap();
+
+    /// Files processed per minute by the file fetcher.
+    pub static ref BROKER_FETCHER_THROUGHPUT_PER_MIN: Gauge = Gauge::new(
+        "haunted_house_broker_fetcher_throughput_per_minute", "Files processed per minute by the file fetcher."
+    ).unwrap();
+
+    /// Retry attempts per minute in the file fetcher.
+    pub static ref BROKER_FETCHER_RETRIES_PER_MIN: Gauge = Gauge::new(
+        "haunted_house_broker_fetcher_retries_per_minute", "Retry attempts per minute in the file fetcher."
+    ).unwrap();
+
+    /// Rows returned by last ES fetch query.
+    pub static ref BROKER_LAST_FETCH_ROWS: Gauge = Gauge::new(
+        "haunted_house_broker_last_fetch_rows", "Rows returned by the last ES fetch query."
+    ).unwrap();
+
+    // ========================================================================
+    // Broker: search metrics
+    // ========================================================================
+
+    /// Number of currently running searches.
+    pub static ref BROKER_ACTIVE_SEARCHES: IntGauge = IntGauge::new(
+        "haunted_house_broker_active_searches", "Number of currently running searches."
+    ).unwrap();
+
+    /// Total number of searches submitted.
+    pub static ref BROKER_SEARCHES_SUBMITTED: Counter = Counter::with_opts(
+        Opts::new("haunted_house_broker_searches_submitted_total", "Total number of search requests submitted.")
+    ).unwrap();
+
+    /// Total number of searches completed successfully.
+    pub static ref BROKER_SEARCHES_COMPLETED: Counter = Counter::with_opts(
+        Opts::new("haunted_house_broker_searches_completed_total", "Total number of searches completed successfully.")
+    ).unwrap();
+
+    /// Wall-clock duration of searches.
+    pub static ref BROKER_SEARCH_DURATION: Histogram = Histogram::with_opts(
+        HistogramOpts::new("haunted_house_broker_search_duration_seconds", "End-to-end duration of searches.")
+            .buckets(vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0])
+    ).unwrap();
+
+    // ========================================================================
     // Process metrics
     // ========================================================================
 
@@ -234,6 +303,26 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(GC_RUN_DURATION.clone())).unwrap();
 
     // Process
+    REGISTRY.register(Box::new(BUILD_INFO.clone())).unwrap();
+    REGISTRY.register(Box::new(UPTIME_SECONDS.clone())).unwrap();
+}
+
+/// Register broker-specific metrics with the global registry.
+pub fn register_broker_metrics() {
+    REGISTRY.register(Box::new(BROKER_CHECKPOINT_LAG.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_READ_CURSOR_LAG.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_PENDING_FILES.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_INFLIGHT.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_FETCHER_SEARCHES_PER_MIN.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_FETCHER_THROUGHPUT_PER_MIN.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_FETCHER_RETRIES_PER_MIN.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_LAST_FETCH_ROWS.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_ACTIVE_SEARCHES.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_SEARCHES_SUBMITTED.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_SEARCHES_COMPLETED.clone())).unwrap();
+    REGISTRY.register(Box::new(BROKER_SEARCH_DURATION.clone())).unwrap();
+
+    // Process (shared)
     REGISTRY.register(Box::new(BUILD_INFO.clone())).unwrap();
     REGISTRY.register(Box::new(UPTIME_SECONDS.clone())).unwrap();
 }
