@@ -79,7 +79,7 @@ impl Datastore {
             seen: Vec<DateTime<Utc>>,
         }
 
-        let result = self.file.search::<Fields>(&format!("seen.last: [{} TO now-10m] AND (expiry_ts: [now+1d TO *] OR (NOT _exists_:expiry_ts))", seek_point.to_rfc3339()))
+        let result = self.file.search::<Fields>(&format!("seen.last: [{} TO now-10m] AND (expiry_ts: [now+1d TO *] OR (NOT _exists_:expiry_ts)) AND is_supplementary: false AND is_section_image: false", seek_point.to_rfc3339()))
             .size(batch_size)
             .full_source(false)
             .sort(json!({"seen.last": "asc"}))

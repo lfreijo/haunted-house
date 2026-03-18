@@ -230,7 +230,7 @@ async fn _fetch_agent(core: Arc<HouseCore>, control: Arc<Mutex<mpsc::Receiver<Fe
                                 finished: entry.get().finished,
                                 retries: entry.get().retries,
                             });
-                        let mut pending = client.count_files(&format!("seen.last: {{{} TO now-10m]", seek_point.to_rfc3339()), 1_000_000).await?;
+                        let mut pending = client.count_files(&format!("seen.last: {{{} TO now-10m] AND is_supplementary: false AND is_section_image: false", seek_point.to_rfc3339()), 1_000_000).await?;
                         pending += running.len() as u64;
 
                         _ = respond.send(FetchStatus {
